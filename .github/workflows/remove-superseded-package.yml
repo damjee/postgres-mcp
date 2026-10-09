@@ -1,0 +1,30 @@
+name: Remove one superseded package version
+
+on:
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
+jobs:
+  remove-exact-version:
+    if: github.repository == 'damjee/postgres-mcp' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify exact version and delete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          endpoint="/users/damjee/packages/container/postgres-mcp/versions/1360591204"
+          expected="sha256:c6d4985fd445fbb1cd8a146bd869220b7b2ce8d5a35c5901d0020fd956474804"
+          version=$(gh api "$endpoint")
+          test "$(jq -r '.id' <<< "$version")" = "1360591204"
+          test "$(jq -r '.name' <<< "$version")" = "$expected"
+          gh api --method DELETE "$endpoint"
+          status=$(curl --silent --show-error --output /tmp/version-check.json --write-out '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com$endpoint")
+          test "$status" = "404"
+          echo "Removed the exact superseded package version; authenticated readback returned 404." >> "$GITHUB_STEP_SUMMARY"
