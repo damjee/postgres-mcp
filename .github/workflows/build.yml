@@ -1,50 +1,89 @@
-name: Postgres MCP CI
+name: Build, test, and publish container
 
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - "**/README.md"
   pull_request:
-    types: [opened, synchronize, reopened]
-    paths-ignore:
-      - "**/README.md"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  postgres-mcp-ci:
+  build-test:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          python-version: "3.12"
-
-      - name: Start Docker service
-        run: sudo service docker start || true
-
-      - name: Verify Docker is running
-        run: docker info
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          version: "0.6.9"
-
-      - name: Build
-        run: uv sync
-
-      - name: Run Lint
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: '0.6.9'
+          enable-cache: false
+      - run: uv sync --frozen
+      - name: Lint and typecheck
         run: |
-          uv run ruff format --check .
-          uv run ruff check .
+          uv run --frozen ruff check .
+          uv run --frozen ruff format --check .
+          uv run --frozen pyright
+      - name: Upstream and configuration tests
+        run: uv run --frozen pytest -q
+      - name: Build linux/amd64 image
+        run: docker build --platform linux/amd64 --build-arg VCS_REF="$GITHUB_SHA" -t postgres-mcp:test .
+      - name: Native MCP and PostgreSQL acceptance tests
+        run: |
+          set -euo pipefail
+          test -s README.md
+          test -s tests/unit/test_container_config.py
+          test -s scripts/container_smoke.py
+          uv run --frozen python scripts/container_smoke.py | tee /tmp/mcp-acceptance.log
+          grep -q '^PASS: Docker startup' /tmp/mcp-acceptance.log
+      - name: Save tested image
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: docker save postgres-mcp:test -o /tmp/postgres-mcp.tar
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        with:
+          name: tested-image
+          path: /tmp/postgres-mcp.tar
+          retention-days: 1
+          compression-level: 0
 
-      - name: Run Check
-        run: uv run pyright
-
-      - name: Run Tests
-        run: uv run pytest -v --log-cli-level=INFO
+  publish:
+    needs: build-test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'damjee/postgres-mcp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tested-image
+          path: /tmp
+      - name: Publish tested image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/damjee/postgres-mcp"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io' EXIT
+          docker load -i /tmp/postgres-mcp.tar
+          docker tag postgres-mcp:test "$image:sha-$GITHUB_SHA"
+          docker tag postgres-mcp:test "$image:latest"
+          docker push "$image:sha-$GITHUB_SHA"
+          docker push "$image:latest"
+          docker pull "$image:sha-$GITHUB_SHA"
+          digest=$(docker image inspect "$image:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')
+          test "$(docker image inspect "$image:sha-$GITHUB_SHA" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+          printf 'Published `%s:sha-%s`\n\nDigest: `%s`\n' "$image" "$GITHUB_SHA" "$digest" >> "$GITHUB_STEP_SUMMARY"

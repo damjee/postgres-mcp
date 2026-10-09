@@ -16,6 +16,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from pydantic import validate_call
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 
@@ -554,7 +556,8 @@ async def get_top_queries(
         return format_error_response(str(e))
 
 
-async def main():
+def parse_args(argv=None):
+    """CLI options override environment defaults; preserve upstream transports."""
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="PostgreSQL MCP Server")
     parser.add_argument("database_url", help="Database connection URL", nargs="?")
@@ -562,42 +565,71 @@ async def main():
         "--access-mode",
         type=str,
         choices=[mode.value for mode in AccessMode],
-        default=AccessMode.UNRESTRICTED.value,
+        default=os.environ.get("MCP_ACCESS_MODE", AccessMode.UNRESTRICTED.value),
         help="Set SQL access mode: unrestricted (unrestricted) or restricted (read-only with protections)",
     )
     parser.add_argument(
         "--transport",
         type=str,
         choices=["stdio", "sse", "streamable-http"],
-        default="stdio",
+        default=os.environ.get("MCP_TRANSPORT", "stdio"),
         help="Select MCP transport: stdio (default), sse, or streamable-http",
     )
     parser.add_argument(
         "--sse-host",
         type=str,
-        default="localhost",
+        default=os.environ.get("MCP_HOST", "localhost"),
         help="Host to bind SSE server to (default: localhost)",
     )
     parser.add_argument(
         "--sse-port",
         type=int,
-        default=8000,
+        default=os.environ.get("MCP_PORT", "8000"),
         help="Port for SSE server (default: 8000)",
     )
     parser.add_argument(
         "--streamable-http-host",
         type=str,
-        default="localhost",
+        default=os.environ.get("MCP_HOST", "localhost"),
         help="Host to bind streamable HTTP server to (default: localhost)",
     )
     parser.add_argument(
         "--streamable-http-port",
         type=int,
-        default=8000,
+        default=os.environ.get("MCP_PORT", "8000"),
         help="Port for streamable HTTP server (default: 8000)",
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--allowed-hosts", default=os.environ.get("MCP_ALLOWED_HOSTS", ""), help="Comma-separated additional trusted HTTP Host values, including port"
+    )
+    parser.add_argument(
+        "--allowed-origins", default=os.environ.get("MCP_ALLOWED_ORIGINS", ""), help="Comma-separated additional trusted browser origins"
+    )
+    args = parser.parse_args(argv)
+    if args.transport not in ("stdio", "sse", "streamable-http"):
+        parser.error("Invalid MCP_TRANSPORT")
+    if args.access_mode not in [mode.value for mode in AccessMode]:
+        parser.error("Invalid MCP_ACCESS_MODE")
+    for port in (args.sse_port, args.streamable_http_port):
+        if not 1 <= port <= 65535:
+            parser.error("Port must be between 1 and 65535")
+    return args
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    """Process liveness only; does not assert database readiness."""
+    return JSONResponse({"status": "ok"})
+
+
+async def main():
+    args = parse_args()
+    # Keep the SDK's localhost protections and explicitly allow intended LAN hosts.
+    security = mcp.settings.transport_security
+    if security is not None:
+        security.allowed_hosts.extend(value.strip() for value in args.allowed_hosts.split(",") if value.strip())
+        security.allowed_origins.extend(value.strip() for value in args.allowed_origins.split(",") if value.strip())
 
     # Store the access mode in the global variable
     global current_access_mode
